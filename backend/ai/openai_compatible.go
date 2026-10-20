@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // OpenAICompatibleProvider nói chuyện với bất kỳ dịch vụ nào theo chuẩn
@@ -21,7 +22,9 @@ type OpenAICompatibleProvider struct {
 	apiKey       string
 	model        string
 	baseURL      string
+	chatEndpoint string // normalized full endpoint, custom only
 	maxTokens    int
+	timeout      time.Duration // entire request/retry budget, custom only
 }
 
 const (
@@ -107,6 +110,11 @@ func (r chatCompletionResponse) errorMessage() string {
 }
 
 func (p *OpenAICompatibleProvider) AnalyzeChat(ctx context.Context, systemPrompt string, chatTranscript string) (AIResponse, error) {
+	if p.providerName == "custom" {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.timeout)
+		defer cancel()
+	}
 	return withRetry(ctx, p.providerName, func() (AIResponse, error) {
 		body := map[string]any{
 			"model": p.model,
@@ -128,14 +136,24 @@ func (p *OpenAICompatibleProvider) AnalyzeChat(ctx context.Context, systemPrompt
 			return AIResponse{}, fmt.Errorf("%s marshal request: %w", p.providerName, err)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(payload))
+		endpoint := p.baseURL + "/chat/completions"
+		if p.chatEndpoint != "" {
+			endpoint = p.chatEndpoint
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 		if err != nil {
 			return AIResponse{}, fmt.Errorf("%s create request: %w", p.providerName, err)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		if p.apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		}
 
-		resp, err := NewHTTPClientWithTimeout().Do(req)
+		client := NewHTTPClientWithTimeout()
+		if p.providerName == "custom" {
+			client.Timeout = p.timeout
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			return AIResponse{}, fmt.Errorf("%s api error: %w", p.providerName, err)
 		}

@@ -11,10 +11,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/vietbui/chat-quality-agent/ai"
 )
 
 const (
@@ -25,6 +28,7 @@ const (
 )
 
 var validModelID = regexp.MustCompile(`^[a-zA-Z0-9._\-]+$`)
+var validCustomModelID = regexp.MustCompile(`^[a-zA-Z0-9._/:\-]+$`)
 
 // Model là một lựa chọn hiển thị trong phần cấu hình.
 type Model struct {
@@ -214,12 +218,34 @@ func FetchOpenAICompatible(ctx context.Context, apiKey, baseURL, defaultBaseURL 
 		endpoint = defaultBaseURL
 	}
 	endpoint += "/models"
+	return fetchOpenAIModels(ctx, apiKey, endpoint, false)
+}
 
+// FetchCustom derives the sibling models endpoint without dropping query routing.
+func FetchCustom(ctx context.Context, apiKey, endpoint string) ([]Model, error) {
+	normalized, err := ai.NormalizeCustomEndpoint(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(normalized)
+	if err != nil {
+		return nil, err
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/chat/completions") + "/models"
+	if u.RawPath != "" {
+		u.RawPath = strings.TrimSuffix(u.RawPath, "/chat/completions") + "/models"
+	}
+	return fetchOpenAIModels(ctx, apiKey, u.String(), true)
+}
+
+func fetchOpenAIModels(ctx context.Context, apiKey, endpoint string, custom bool) ([]Model, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating models request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 
 	resp, err := httpClient().Do(req)
 	if err != nil {
@@ -251,7 +277,11 @@ func FetchOpenAICompatible(ctx context.Context, apiKey, baseURL, defaultBaseURL 
 	}
 	var items []dated
 	for _, m := range payload.Data {
-		if !validID(m.ID) || !usableForChat(m.ID) {
+		valid := validID(m.ID)
+		if custom {
+			valid = m.ID != "" && len(m.ID) <= maxModelNameLen && validCustomModelID.MatchString(m.ID)
+		}
+		if !valid || !usableForChat(m.ID) {
 			continue
 		}
 		items = append(items, dated{Model{ID: m.ID, Title: m.ID}, m.Created})

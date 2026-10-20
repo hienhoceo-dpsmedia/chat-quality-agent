@@ -13,7 +13,6 @@ import (
 	"github.com/vietbui/chat-quality-agent/config"
 	"github.com/vietbui/chat-quality-agent/db"
 	"github.com/vietbui/chat-quality-agent/db/models"
-	"github.com/vietbui/chat-quality-agent/pkg"
 )
 
 // Danh sách model đổi rất hiếm, nên bản lưu dùng được cả ngày.
@@ -63,6 +62,8 @@ var staticXAIModels = []catalog.Model{
 
 func staticModels(provider string) []catalog.Model {
 	switch provider {
+	case "custom":
+		return []catalog.Model{}
 	case "gemini":
 		return staticGeminiModels
 	case "openai":
@@ -81,18 +82,24 @@ func staticModels(provider string) []catalog.Model {
 // khi nhà cung cấp đã gỡ nó đi.
 func ListAIModels(c *gin.Context) {
 	tenantID := middleware.GetTenantID(c)
-	provider := settingValue(tenantID, "ai_provider")
-	if provider == "" {
-		provider = "claude"
+	saved, err := loadSavedAISettings(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "config_error"})
+		return
 	}
-	currentModel := settingValue(tenantID, "ai_model")
+	provider, currentModel := saved.Config.Provider, saved.Config.Model
+	cfg, err := resolveModelSettings(nil, saved)
+	if err != nil {
+		respondModelFallback(c, provider, currentModel)
+		return
+	}
 
-	cached, fetchedAt := readModelCache(tenantID, provider)
+	cached, fetchedAt := readModelCache(tenantID, cfg)
 	if len(cached) > 0 {
 		fresh := time.Since(fetchedAt) < modelCacheTTL
 		if !fresh {
 			// Làm mới ngầm, người dùng vẫn nhận danh sách cũ ngay lập tức.
-			go refreshModelsInBackground(tenantID, provider)
+			go refreshModelsInBackground(tenantID, cfg)
 		}
 		c.JSON(http.StatusOK, modelListResponse{
 			Provider:  provider,
@@ -104,18 +111,13 @@ func ListAIModels(c *gin.Context) {
 	}
 
 	// Chưa có bản lưu nào: thử lấy ngay, hỏng thì dùng danh sách dự phòng.
-	fetched, err := fetchModels(c.Request.Context(), tenantID, provider)
+	fetched, err := fetchModels(c.Request.Context(), cfg)
 	if err != nil {
-		c.JSON(http.StatusOK, modelListResponse{
-			Provider: provider,
-			Models:   catalog.EnsureContains(staticModels(provider), currentModel),
-			Source:   "static",
-			Message:  "Chưa lấy được danh sách từ nhà cung cấp, đang hiển thị danh sách có sẵn",
-		})
+		respondModelFallback(c, provider, currentModel)
 		return
 	}
 
-	saveModelCache(tenantID, provider, fetched)
+	saveModelCache(tenantID, cfg, fetched)
 	c.JSON(http.StatusOK, modelListResponse{
 		Provider:  provider,
 		Models:    catalog.EnsureContains(fetched, currentModel),
@@ -124,16 +126,35 @@ func ListAIModels(c *gin.Context) {
 	})
 }
 
+func respondModelFallback(c *gin.Context, provider, currentModel string) {
+	message := "Chưa lấy được danh sách từ nhà cung cấp, đang hiển thị danh sách có sẵn"
+	if provider == "custom" {
+		message = "Chưa lấy được danh sách model; bạn vẫn có thể nhập model thủ công"
+	}
+	c.JSON(http.StatusOK, modelListResponse{Provider: provider, Models: catalog.EnsureContains(staticModels(provider), currentModel), Source: "static", Message: message})
+}
+
 // RefreshAIModels ép lấy lại danh sách ngay, phục vụ nút Làm mới.
 func RefreshAIModels(c *gin.Context) {
 	tenantID := middleware.GetTenantID(c)
-	provider := settingValue(tenantID, "ai_provider")
-	if provider == "" {
-		provider = "claude"
+	draft, err := decodeAIDraft(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
 	}
-	currentModel := settingValue(tenantID, "ai_model")
+	saved, err := loadSavedAISettings(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "config_error"})
+		return
+	}
+	cfg, err := resolveModelSettings(draft, saved)
+	if err != nil {
+		aiConfigError(c, err)
+		return
+	}
+	provider, currentModel := cfg.Provider, cfg.Model
 
-	fetched, err := fetchModels(c.Request.Context(), tenantID, provider)
+	fetched, err := fetchModels(c.Request.Context(), cfg)
 	if err != nil {
 		code, message := classifyProviderError(err)
 		// classifyProviderError viết cho việc thử key; với việc lấy danh sách thì
@@ -147,7 +168,10 @@ func RefreshAIModels(c *gin.Context) {
 		return
 	}
 
-	saveModelCache(tenantID, provider, fetched)
+	// Draft discovery must not persist configuration or poison the saved cache.
+	if draft == nil {
+		saveModelCache(tenantID, cfg, fetched)
+	}
 	c.JSON(http.StatusOK, modelListResponse{
 		Provider:  provider,
 		Models:    catalog.EnsureContains(fetched, currentModel),
@@ -156,35 +180,30 @@ func RefreshAIModels(c *gin.Context) {
 	})
 }
 
-func fetchModels(ctx context.Context, tenantID, provider string) ([]catalog.Model, error) {
+func resolveModelSettings(draft *aiSettingsRequest, saved savedAISettings) (aiSettingsRequest, error) {
 	cfg, err := config.Load()
 	if err != nil {
-		return nil, err
+		return aiSettingsRequest{}, err
 	}
+	return resolveAISettings(draft, saved, cfg.EncryptionKey, false)
+}
 
-	var setting models.AppSetting
-	if err := db.DB.Where("tenant_id = ? AND setting_key = ?", tenantID, "ai_api_key").First(&setting).Error; err != nil {
-		return nil, err
-	}
-	apiKey, err := pkg.Decrypt(setting.ValueEncrypted, cfg.EncryptionKey)
-	if err != nil {
-		return nil, err
-	}
-
-	baseURL := settingValue(tenantID, "ai_base_url")
-	switch provider {
+func fetchModels(ctx context.Context, cfg aiSettingsRequest) ([]catalog.Model, error) {
+	switch cfg.Provider {
+	case "custom":
+		return catalog.FetchCustom(ctx, cfg.APIKey, cfg.BaseURL)
 	case "gemini":
-		return catalog.FetchGemini(ctx, string(apiKey), baseURL)
+		return catalog.FetchGemini(ctx, cfg.APIKey, cfg.BaseURL)
 	case "openai":
-		return catalog.FetchOpenAICompatible(ctx, string(apiKey), baseURL, "https://api.openai.com/v1")
+		return catalog.FetchOpenAICompatible(ctx, cfg.APIKey, cfg.BaseURL, "https://api.openai.com/v1")
 	case "xai":
-		return catalog.FetchOpenAICompatible(ctx, string(apiKey), baseURL, "https://api.x.ai/v1")
+		return catalog.FetchOpenAICompatible(ctx, cfg.APIKey, cfg.BaseURL, "https://api.x.ai/v1")
 	default:
-		return catalog.FetchClaude(ctx, string(apiKey), baseURL)
+		return catalog.FetchClaude(ctx, cfg.APIKey, cfg.BaseURL)
 	}
 }
 
-func refreshModelsInBackground(tenantID, provider string) {
+func refreshModelsInBackground(tenantID string, cfg aiSettingsRequest) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[security] panic recovered khi làm mới danh sách model: %v", r)
@@ -194,28 +213,29 @@ func refreshModelsInBackground(tenantID, provider string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	fetched, err := fetchModels(ctx, tenantID, provider)
+	fetched, err := fetchModels(ctx, cfg)
 	if err != nil {
-		log.Printf("[ai] làm mới ngầm danh sách model thất bại: tenant=%s provider=%s", tenantID, provider)
+		log.Printf("[ai] làm mới ngầm danh sách model thất bại: tenant=%s provider=%s", tenantID, cfg.Provider)
 		return
 	}
-	saveModelCache(tenantID, provider, fetched)
+	saveModelCache(tenantID, cfg, fetched)
 }
 
-func readModelCache(tenantID, provider string) ([]catalog.Model, time.Time) {
+func readModelCache(tenantID string, cfg aiSettingsRequest) ([]catalog.Model, time.Time) {
 	raw := settingValue(tenantID, settingModelsCache)
 	if raw == "" {
 		return nil, time.Time{}
 	}
 	var stored struct {
 		Provider string          `json:"provider"`
+		Identity string          `json:"identity"`
 		Models   []catalog.Model `json:"models"`
 	}
 	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
 		return nil, time.Time{}
 	}
 	// Đổi nhà cung cấp thì bản lưu cũ không dùng được.
-	if stored.Provider != provider {
+	if stored.Provider != cfg.Provider || stored.Identity != modelCacheIdentity(cfg) {
 		return nil, time.Time{}
 	}
 	fetchedAt, err := time.Parse(time.RFC3339, settingValue(tenantID, settingModelsFetched))
@@ -225,11 +245,12 @@ func readModelCache(tenantID, provider string) ([]catalog.Model, time.Time) {
 	return stored.Models, fetchedAt
 }
 
-func saveModelCache(tenantID, provider string, list []catalog.Model) {
+func saveModelCache(tenantID string, cfg aiSettingsRequest, list []catalog.Model) {
 	payload, err := json.Marshal(struct {
 		Provider string          `json:"provider"`
+		Identity string          `json:"identity"`
 		Models   []catalog.Model `json:"models"`
-	}{provider, list})
+	}{cfg.Provider, modelCacheIdentity(cfg), list})
 	if err != nil {
 		log.Printf("[ai] không lưu được danh sách model: %v", err)
 		return

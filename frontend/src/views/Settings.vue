@@ -37,7 +37,18 @@
           />
 
           <div class="d-flex align-start ga-2 mb-3">
+            <v-combobox
+              v-if="aiSettings.provider === 'custom'"
+              v-model="aiSettings.model"
+              label="Model ID"
+              :items="modelOptions"
+              :return-object="false"
+              hint="Nhập đúng tên model trên máy chủ, hoặc chọn từ danh sách khi có hỗ trợ /models"
+              persistent-hint
+              class="flex-grow-1"
+            />
             <v-select
+              v-else
               v-model="aiSettings.model"
               :label="$t('ai_model')"
               :items="modelOptions"
@@ -54,13 +65,16 @@
               @click="refreshModelList"
             />
           </div>
-          <div v-if="modelsSource === 'static'" class="text-caption text-grey mb-3">
+          <div v-if="modelsSource === 'static' && aiSettings.provider !== 'custom'" class="text-caption text-grey mb-3">
             {{ $t('model_list_static') }}
           </div>
 
           <v-text-field
             v-model="aiSettings.apiKey"
-            :label="$t('api_key')"
+            :label="aiSettings.provider === 'custom' ? 'API key (tùy chọn)' : $t('api_key')"
+            :hint="aiSettings.provider === 'custom' ? 'Để trống nếu máy chủ không yêu cầu xác thực. Xóa nội dung ô này để bỏ key đã lưu.' : undefined"
+            :persistent-hint="aiSettings.provider === 'custom'"
+            :clearable="aiSettings.provider === 'custom'"
             :type="showKey ? 'text' : 'password'"
             :append-inner-icon="showKey ? 'mdi-eye-off' : 'mdi-eye'"
             @click:append-inner="showKey = !showKey"
@@ -68,22 +82,25 @@
           />
 
           <v-switch
+            v-if="aiSettings.provider !== 'custom'"
             v-model="useCustomBaseUrl"
             label="Tùy chỉnh API URL"
             color="primary"
             density="compact"
             hide-details
             class="mt-1 mb-2"
+            @update:model-value="onEndpointChange"
           />
-          <div v-if="!useCustomBaseUrl" class="text-caption text-grey mb-2">Bật khi cần dùng proxy (OpenRouter, LiteLLM, CLIProxy) hoặc máy chủ tự dựng</div>
-          <div v-else class="text-caption text-grey mb-2">Điền xong hãy lưu cài đặt rồi bấm nút làm mới cạnh ô Model AI, danh sách model sẽ lấy theo đúng proxy này</div>
+          <div v-if="aiSettings.provider === 'custom'" class="text-caption text-grey mb-2">Tương thích OpenAI Chat Completions. Có thể dán endpoint đầy đủ; ứng dụng không nối lặp /chat/completions.</div>
+          <div v-else-if="!useCustomBaseUrl" class="text-caption text-grey mb-2">Bật khi cần dùng proxy (OpenRouter, LiteLLM, CLIProxy) hoặc máy chủ tự dựng</div>
+          <div v-else class="text-caption text-grey mb-2">Làm mới model và kiểm tra kết nối dùng cấu hình đang nhập, không cần lưu trước.</div>
 
           <v-text-field
-            v-if="useCustomBaseUrl"
+            v-if="useCustomBaseUrl || aiSettings.provider === 'custom'"
             v-model="aiSettings.baseUrl"
-            label="Base URL"
+            :label="aiSettings.provider === 'custom' ? 'Endpoint / Base URL' : 'Base URL'"
             :placeholder="baseUrlPlaceholder"
-            hint="Để trống để dùng mặc định"
+            :hint="aiSettings.provider === 'custom' ? 'Ví dụ: https://may-chu-cua-ban/v1/chat/completions hoặc https://may-chu-cua-ban/v1' : 'Để trống để dùng mặc định'"
             persistent-hint
             clearable
             :rules="[
@@ -91,12 +108,29 @@
               v => !v || v.startsWith('http://') || v.startsWith('https://') || 'URL phải bắt đầu bằng http:// hoặc https://',
             ]"
             class="mb-3"
+            @update:model-value="onEndpointChange"
           />
 
-          <div class="d-flex ga-2">
+          <v-text-field
+            v-if="aiSettings.provider === 'custom'"
+            v-model.number="aiSettings.timeoutSeconds"
+            label="Thời gian chờ / Timeout (giây)"
+            type="number"
+            min="5"
+            max="600"
+            step="1"
+            hint="Từ 5 đến 600 giây. Áp dụng cho kiểm tra kết nối và mỗi lượt phân tích AI, kể cả batch."
+            persistent-hint
+            class="mb-3"
+          />
+
+          <div class="d-flex ga-2 flex-wrap">
             <v-btn color="primary" :loading="savingAI" @click="saveAI">{{ $t('save_settings') }}</v-btn>
-            <v-btn variant="outlined" :loading="testingKey" @click="testKey">{{ $t('test_api_key') }}</v-btn>
+            <v-btn variant="outlined" :loading="testingKey" @click="testKey">Kiểm tra kết nối</v-btn>
           </div>
+          <v-alert v-if="aiTestResult" class="mt-4" :type="aiTestResult.ok ? 'success' : 'error'" variant="tonal" density="compact">
+            {{ aiTestResult.message }}
+          </v-alert>
         </v-card>
 
         <!-- General -->
@@ -359,10 +393,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import api from '../api'
+import { aiSettingsPayload, validateAISettings, MASKED_AI_KEY } from '../lib/aiSettings'
+import { useAIModelCatalog } from '../composables/aiModelCatalog'
 
 const route = useRoute()
 const { t } = useI18n()
@@ -376,6 +412,7 @@ const snackColor = ref('success')
 
 const savingAI = ref(false)
 const testingKey = ref(false)
+const aiTestResult = ref<{ ok: boolean; message: string } | null>(null)
 const savingGeneral = ref(false)
 const savingStorage = ref(false)
 const testingStorage = ref(false)
@@ -441,6 +478,7 @@ const providerOptions = [
   { title: 'Gemini (Google)', value: 'gemini' },
   { title: 'ChatGPT (OpenAI)', value: 'openai' },
   { title: 'Grok (xAI)', value: 'xai' },
+  { title: 'Custom AI — OpenAI-compatible', value: 'custom' },
 ]
 const openaiModels = [
   { title: 'GPT-5 (Khuyến nghị)', value: 'gpt-5' },
@@ -462,7 +500,10 @@ const geminiModels = [
 
 const useCustomBaseUrl = ref(false)
 const hasSavedKey = ref(false)
-const aiSettings = reactive({ provider: 'claude', model: 'claude-sonnet-5', apiKey: '', baseUrl: '', batchMode: true, batchSize: 5 })
+const aiSettings = reactive({ provider: 'claude', model: 'claude-sonnet-5', apiKey: '', baseUrl: '', batchMode: true, batchSize: 5, timeoutSeconds: 120 })
+watch(() => [aiSettings.provider, aiSettings.model, aiSettings.apiKey, aiSettings.baseUrl, aiSettings.timeoutSeconds, useCustomBaseUrl.value], () => {
+  aiTestResult.value = null
+})
 const generalSettings = reactive({ companyName: '', timezone: 'Asia/Ho_Chi_Minh', language: 'vi', exchangeRate: 26000, appUrl: '' })
 
 const appUrlRules = [
@@ -472,6 +513,7 @@ const appUrlRules = [
 
 const baseUrlPlaceholder = computed(() => {
   switch (aiSettings.provider) {
+    case 'custom': return 'https://may-chu-cua-ban/v1/chat/completions'
     case 'gemini': return 'https://generativelanguage.googleapis.com'
     case 'openai': return 'https://api.openai.com/v1'
     case 'xai': return 'https://api.x.ai/v1'
@@ -481,6 +523,7 @@ const baseUrlPlaceholder = computed(() => {
 
 function fallbackModels(provider: string) {
   switch (provider) {
+    case 'custom': return []
     case 'gemini': return geminiModels
     case 'openai': return openaiModels
     case 'xai': return xaiModels
@@ -490,6 +533,7 @@ function fallbackModels(provider: string) {
 
 function defaultModelFor(provider: string) {
   switch (provider) {
+    case 'custom': return ''
     case 'gemini': return 'gemini-3.8-flash'
     case 'openai': return 'gpt-5'
     case 'xai': return 'grok-4'
@@ -498,8 +542,10 @@ function defaultModelFor(provider: string) {
 }
 
 // Danh sách lấy từ nhà cung cấp nếu có, không thì dùng danh sách kèm sẵn.
-const fetchedModels = ref<{ id: string; title: string }[]>([])
-const modelsSource = ref('')
+const { fetchedModels, modelsSource, loadCatalog } = useAIModelCatalog(() => {
+  const payload = aiSettingsPayload(aiSettings, useCustomBaseUrl.value)
+  return JSON.stringify([payload.provider, payload.base_url, payload.api_key, payload.clear_api_key])
+})
 const refreshingModels = ref(false)
 
 const modelOptions = computed(() => {
@@ -516,22 +562,29 @@ const modelOptions = computed(() => {
 
 async function loadModelList() {
   try {
-    const { data } = await api.get(`/tenants/${tenantId.value}/settings/ai/models`)
-    fetchedModels.value = data.models || []
-    modelsSource.value = data.source || ''
+    await loadCatalog(async () => {
+      const { data } = await api.get(`/tenants/${tenantId.value}/settings/ai/models`)
+      return data
+    })
   } catch {
     // Không lấy được thì im lặng dùng danh sách kèm sẵn
-    fetchedModels.value = []
-    modelsSource.value = 'static'
   }
 }
 
 async function refreshModelList() {
+  const validation = validateAISettings(aiSettings, useCustomBaseUrl.value, hasSavedKey.value, false)
+  if (validation) {
+    showSnack(validation, 'error')
+    return
+  }
+  const draft = aiSettingsPayload(aiSettings, useCustomBaseUrl.value)
   refreshingModels.value = true
   try {
-    const { data } = await api.post(`/tenants/${tenantId.value}/settings/ai/models/refresh`)
-    fetchedModels.value = data.models || []
-    modelsSource.value = data.source || ''
+    const data = await loadCatalog(async () => {
+      const { data } = await api.post(`/tenants/${tenantId.value}/settings/ai/models/refresh`, draft)
+      return data
+    })
+    if (!data) return
     showSnack(`Đã cập nhật ${fetchedModels.value.length} model`, 'success')
   } catch (err: any) {
     const res = err.response?.data
@@ -544,7 +597,20 @@ async function refreshModelList() {
 function onProviderChange() {
   // Reset to default model when switching provider
   aiSettings.model = defaultModelFor(aiSettings.provider)
+  aiSettings.apiKey = ''
+  aiSettings.baseUrl = ''
+  aiSettings.timeoutSeconds = 120
+  hasSavedKey.value = false
+  useCustomBaseUrl.value = aiSettings.provider === 'custom'
   // Danh sách model của nhà cung cấp cũ không còn đúng nữa
+  fetchedModels.value = []
+  modelsSource.value = ''
+}
+
+function onEndpointChange() {
+  // Never reuse a saved credential against a newly entered host.
+  if (aiSettings.apiKey === MASKED_AI_KEY) aiSettings.apiKey = ''
+  hasSavedKey.value = false
   fetchedModels.value = []
   modelsSource.value = ''
 }
@@ -554,14 +620,11 @@ async function loadSettings() {
     const { data } = await api.get(`/tenants/${tenantId.value}/settings`)
     if (data.settings.ai_provider) aiSettings.provider = data.settings.ai_provider
     if (data.settings.ai_model) aiSettings.model = data.settings.ai_model
-    if (data.settings.ai_api_key) {
-      aiSettings.apiKey = data.settings.ai_api_key
-      hasSavedKey.value = true
-    }
-    if (data.settings.ai_base_url) {
-      aiSettings.baseUrl = data.settings.ai_base_url
-      useCustomBaseUrl.value = true
-    }
+    aiSettings.apiKey = data.settings.ai_api_key || ''
+    hasSavedKey.value = !!data.settings.ai_api_key
+    aiSettings.baseUrl = data.settings.ai_base_url || ''
+    aiSettings.timeoutSeconds = data.settings.ai_timeout_seconds ? Number(data.settings.ai_timeout_seconds) : 120
+    useCustomBaseUrl.value = !!data.settings.ai_base_url || aiSettings.provider === 'custom'
     if (data.settings.ai_batch_mode) aiSettings.batchMode = data.settings.ai_batch_mode === 'true'
     if (data.settings.ai_batch_size) aiSettings.batchSize = parseInt(data.settings.ai_batch_size) || 5
     if (data.settings.exchange_rate_vnd) generalSettings.exchangeRate = parseFloat(data.settings.exchange_rate_vnd) || 26000
@@ -594,43 +657,43 @@ async function saveAnalysis() {
 }
 
 async function saveAI() {
-  // Ô key hiển thị dấu chấm khi đã có key lưu sẵn. Gửi chuỗi rỗng để backend
-  // giữ nguyên key cũ, nhờ vậy đổi model hay cỡ lô không phải nhập lại key.
-  const apiKeyToSend = aiSettings.apiKey === '••••••••' ? '' : aiSettings.apiKey
-  if (!apiKeyToSend && !hasSavedKey.value) {
-    showSnack('Vui lòng nhập API Key', 'error')
-    return
-  }
-  if (useCustomBaseUrl.value && !aiSettings.baseUrl) {
-    showSnack('Vui lòng nhập Base URL hoặc tắt tùy chỉnh', 'error')
+  const validation = validateAISettings(aiSettings, useCustomBaseUrl.value, hasSavedKey.value)
+  if (validation) {
+    showSnack(validation, 'error')
     return
   }
   savingAI.value = true
   try {
-    await api.put(`/tenants/${tenantId.value}/settings/ai`, {
-      provider: aiSettings.provider,
-      model: aiSettings.model,
-      api_key: apiKeyToSend,
-      base_url: useCustomBaseUrl.value ? (aiSettings.baseUrl || '') : '',
-      batch_mode: aiSettings.batchMode ? 'true' : 'false',
-      batch_size: String(aiSettings.batchSize),
-    })
+    await api.put(`/tenants/${tenantId.value}/settings/ai`, aiSettingsPayload(aiSettings, useCustomBaseUrl.value))
+    await loadSettings()
     showSnack(t('success'), 'success')
   } catch (err: any) {
-    showSnack(err.response?.data?.error || t('error'), 'error')
+    showSnack(err.response?.data?.message || err.response?.data?.error || t('error'), 'error')
   } finally {
     savingAI.value = false
   }
 }
 
 async function testKey() {
+  const validation = validateAISettings(aiSettings, useCustomBaseUrl.value, hasSavedKey.value)
+  if (validation) {
+    aiTestResult.value = { ok: false, message: validation }
+    return
+  }
+  const draft = aiSettingsPayload(aiSettings, useCustomBaseUrl.value)
   testingKey.value = true
+  aiTestResult.value = null
   try {
-    const { data } = await api.post(`/tenants/${tenantId.value}/settings/ai/test`)
+    const timeout = (aiSettings.provider === 'custom' ? aiSettings.timeoutSeconds : 30) * 1000 + 10000
+    const { data } = await api.post(`/tenants/${tenantId.value}/settings/ai/test`, draft, { timeout })
+    if (JSON.stringify(draft) !== JSON.stringify(aiSettingsPayload(aiSettings, useCustomBaseUrl.value))) return
     const detail = data.model ? `${data.provider} / ${data.model}` : data.provider
+    aiTestResult.value = { ok: true, message: `${detail}: ${data.message}` }
     showSnack(`${detail}: ${data.message}`, 'success')
   } catch (err: any) {
     const res = err.response?.data
+    if (JSON.stringify(draft) !== JSON.stringify(aiSettingsPayload(aiSettings, useCustomBaseUrl.value))) return
+    aiTestResult.value = { ok: false, message: res?.message || res?.error || t('error') }
     showSnack(res?.message || res?.error || t('error'), 'error')
   } finally {
     testingKey.value = false

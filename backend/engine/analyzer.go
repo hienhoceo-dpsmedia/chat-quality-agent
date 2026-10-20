@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/vietbui/chat-quality-agent/db/models"
 	"github.com/vietbui/chat-quality-agent/notifications"
 	"github.com/vietbui/chat-quality-agent/pkg"
+	"gorm.io/gorm"
 )
 
 // Analyzer executes analysis jobs: loads messages, calls AI, saves results.
@@ -433,7 +435,7 @@ func (a *Analyzer) getProvider(job models.Job) (ai.AIProvider, error) {
 	// Get API key from tenant settings
 	var setting models.AppSetting
 	result := db.DB.Where("tenant_id = ? AND setting_key = ?", job.TenantID, "ai_api_key").First(&setting)
-	if result.Error != nil {
+	if result.Error != nil && (provider != "custom" || !errors.Is(result.Error, gorm.ErrRecordNotFound)) {
 		return nil, fmt.Errorf("API key not configured - go to Settings > AI Config")
 	}
 
@@ -445,11 +447,14 @@ func (a *Analyzer) getProvider(job models.Job) (ai.AIProvider, error) {
 		}
 		apiKey = string(decrypted)
 	}
+	if provider != "custom" && strings.TrimSpace(apiKey) == "" {
+		return nil, fmt.Errorf("API key not configured - go to Settings > AI Config")
+	}
 
 	// Get model from tenant settings (fallback to job's ai_model)
 	model := job.AIModel
 	var modelSetting models.AppSetting
-	if err := db.DB.Where("tenant_id = ? AND setting_key = ?", job.TenantID, "ai_model").First(&modelSetting).Error; err == nil && modelSetting.ValuePlain != "" {
+	if err := db.DB.Where("tenant_id = ? AND setting_key = ?", job.TenantID, "ai_model").First(&modelSetting).Error; err == nil && (modelSetting.ValuePlain != "" || provider == "custom") {
 		model = modelSetting.ValuePlain
 	}
 
@@ -469,6 +474,16 @@ func (a *Analyzer) getProvider(job models.Job) (ai.AIProvider, error) {
 		return ai.NewOpenAIProvider(apiKey, model, a.cfg.AIMaxTokens, baseURL), nil
 	case "xai":
 		return ai.NewXAIProvider(apiKey, model, a.cfg.AIMaxTokens, baseURL), nil
+	case "custom":
+		var timeoutSetting models.AppSetting
+		if err := db.DB.Where("tenant_id = ? AND setting_key = ?", job.TenantID, "ai_timeout_seconds").First(&timeoutSetting).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("failed to load custom AI timeout: %w", err)
+		}
+		seconds, err := ai.ParseCustomTimeoutSeconds(timeoutSetting.ValuePlain)
+		if err != nil {
+			return nil, err
+		}
+		return ai.NewCustomProviderWithTimeout(apiKey, model, a.cfg.AIMaxTokens, baseURL, time.Duration(seconds)*time.Second)
 	default:
 		return nil, fmt.Errorf("unsupported AI provider: %s", provider)
 	}

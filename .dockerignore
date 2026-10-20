@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+**/node_modules
+**/dist
+**/.vite
+frontend/.vite-temp
+backend/cqa-server
+backend/*.exe
+**/*.log

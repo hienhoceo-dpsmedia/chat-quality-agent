@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/vietbui/chat-quality-agent/ai"
 	"github.com/vietbui/chat-quality-agent/api/middleware"
 	"github.com/vietbui/chat-quality-agent/config"
 	"github.com/vietbui/chat-quality-agent/db"
 	"github.com/vietbui/chat-quality-agent/db/models"
 	"github.com/vietbui/chat-quality-agent/pkg"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Tham số của riêng phép thử API key — cố ý đặt cực nhỏ để mỗi lần bấm kiểm tra
@@ -69,16 +71,7 @@ func getSettingValue(settings []models.AppSetting, key, defaultVal string) strin
 // SaveAISettings saves AI provider and API key
 func SaveAISettings(c *gin.Context) {
 	tenantID := middleware.GetTenantID(c)
-	var req struct {
-		Provider string `json:"provider" binding:"required,oneof=claude gemini openai xai"`
-		// Để trống nghĩa là giữ nguyên key đã lưu — người dùng không phải nhập
-		// lại key mỗi lần chỉ muốn đổi model hay cỡ lô.
-		APIKey    string `json:"api_key"`
-		Model     string `json:"model"`
-		BaseURL   string `json:"base_url"`
-		BatchMode string `json:"batch_mode"`
-		BatchSize string `json:"batch_size"`
-	}
+	var req aiSettingsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "details": err.Error()})
 		return
@@ -91,48 +84,75 @@ func SaveAISettings(c *gin.Context) {
 		return
 	}
 
-	// Save provider (plain)
-	upsertSetting(tenantID, "ai_provider", req.Provider, nil)
-
-	// Save model (plain)
-	if req.Model != "" {
-		upsertSetting(tenantID, "ai_model", req.Model, nil)
+	saved, err := loadSavedAISettings(tenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "config_error"})
+		return
 	}
-
-	// Save base URL (plain, optional — empty string clears it)
-	if req.BaseURL != "" {
-		upsertSetting(tenantID, "ai_base_url", req.BaseURL, nil)
-	} else {
-		// Explicitly clear: delete the setting if empty
-		db.DB.Where("tenant_id = ? AND setting_key = ?", tenantID, "ai_base_url").Delete(&models.AppSetting{})
+	resolved, err := resolveAISettings(&req, saved, cfg.EncryptionKey, true)
+	if err != nil {
+		aiConfigError(c, err)
+		return
 	}
-
-	// Save API key (encrypted). Bỏ trống thì giữ key cũ, nhưng phải có sẵn key
-	// từ trước, nếu không thì cấu hình sẽ không dùng được.
-	if req.APIKey != "" {
-		encrypted, err := pkg.Encrypt([]byte(req.APIKey), cfg.EncryptionKey)
+	previous, previousErr := resolveAISettings(nil, saved, cfg.EncryptionKey, false)
+	invalidateCache := previousErr != nil || modelCacheIdentity(previous) != modelCacheIdentity(resolved)
+	// Validate and encrypt everything before the first write. A transaction also
+	// prevents storage errors from leaving a partially updated configuration.
+	var encrypted []byte
+	if resolved.APIKey != "" {
+		encrypted, err = pkg.Encrypt([]byte(resolved.APIKey), cfg.EncryptionKey)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "encryption_failed"})
 			return
 		}
-		upsertSetting(tenantID, "ai_api_key", "", encrypted)
-	} else {
-		var existing models.AppSetting
-		if err := db.DB.Where("tenant_id = ? AND setting_key = ?", tenantID, "ai_api_key").First(&existing).Error; err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "api_key_required"})
-			return
+	}
+	err = db.DB.Transaction(func(tx *gorm.DB) error {
+		values := map[string]string{"ai_provider": resolved.Provider, "ai_base_url": resolved.BaseURL}
+		if resolved.Provider == "custom" {
+			values["ai_timeout_seconds"] = strconv.Itoa(resolved.TimeoutSeconds)
 		}
-	}
-
-	// Save batch settings
-	if req.BatchMode != "" {
-		upsertSetting(tenantID, "ai_batch_mode", req.BatchMode, nil)
-	}
-	if req.BatchSize != "" {
-		upsertSetting(tenantID, "ai_batch_size", req.BatchSize, nil)
+		if resolved.Model != "" {
+			values["ai_model"] = resolved.Model
+		}
+		if req.BatchMode != "" {
+			values["ai_batch_mode"] = req.BatchMode
+		}
+		if req.BatchSize != "" {
+			values["ai_batch_size"] = req.BatchSize
+		}
+		for key, value := range values {
+			if err := writeAISetting(tx, tenantID, key, value, nil); err != nil {
+				return err
+			}
+		}
+		if encrypted == nil {
+			if err := tx.Where("tenant_id = ? AND setting_key = ?", tenantID, "ai_api_key").Delete(&models.AppSetting{}).Error; err != nil {
+				return err
+			}
+		} else if err := writeAISetting(tx, tenantID, "ai_api_key", "", encrypted); err != nil {
+			return err
+		}
+		// Cache identity also guards against an in-flight refresh of the old config.
+		if invalidateCache {
+			return tx.Where("tenant_id = ? AND setting_key IN ?", tenantID, []string{settingModelsCache, settingModelsFetched}).Delete(&models.AppSetting{}).Error
+		}
+		return nil
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "save_failed"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "saved"})
+}
+
+func writeAISetting(tx *gorm.DB, tenantID, key, plain string, encrypted []byte) error {
+	now := time.Now()
+	row := models.AppSetting{ID: pkg.NewUUID(), TenantID: tenantID, SettingKey: key, ValuePlain: plain, ValueEncrypted: encrypted, CreatedAt: now, UpdatedAt: now}
+	return tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "setting_key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value_plain", "value_encrypted", "updated_at"}),
+	}).Create(&row).Error
 }
 
 // SaveAnalysisSettings saves batch mode and batch size settings
@@ -191,6 +211,11 @@ func classifyProviderError(err error) (code string, message string) {
 // việc chạy thật mà không ra kết quả.
 func TestAIKey(c *gin.Context) {
 	tenantID := middleware.GetTenantID(c)
+	draft, err := decodeAIDraft(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		log.Printf("[security] loading config failed while testing AI key: %v", err)
@@ -198,59 +223,28 @@ func TestAIKey(c *gin.Context) {
 		return
 	}
 
-	// Get the encrypted API key
-	var setting models.AppSetting
-	if err := db.DB.Where("tenant_id = ? AND setting_key = ?", tenantID, "ai_api_key").First(&setting).Error; err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no_api_key_configured", "message": "Chưa cấu hình API key"})
-		return
-	}
-
-	apiKeyBytes, err := pkg.Decrypt(setting.ValueEncrypted, cfg.EncryptionKey)
+	saved, err := loadSavedAISettings(tenantID)
 	if err != nil {
-		// Hay gặp khi ENCRYPTION_KEY bị đổi sau khi đã lưu key: dữ liệu cũ không
-		// giải mã được nữa và phải nhập lại key.
-		log.Printf("[security] decrypt AI key failed: tenant=%s", tenantID)
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":   "decrypt_failed",
-			"message": "Không giải mã được API key đã lưu, vui lòng nhập lại. Thường xảy ra khi ENCRYPTION_KEY trong .env bị thay đổi",
-		})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "config_error"})
+		return
+	}
+	resolved, err := resolveAISettings(draft, saved, cfg.EncryptionKey, true)
+	if err != nil {
+		if draft == nil && err.Error() == "api_key_required" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "no_api_key_configured", "message": "Chưa cấu hình API key"})
+		} else {
+			aiConfigError(c, err)
+		}
+		return
+	}
+	provider, model := resolved.Provider, resolved.Model
+	client, err := newAITestProvider(resolved)
+	if err != nil {
+		aiConfigError(c, err)
 		return
 	}
 
-	provider := "claude"
-	var providerSetting models.AppSetting
-	if err := db.DB.Where("tenant_id = ? AND setting_key = ?", tenantID, "ai_provider").First(&providerSetting).Error; err == nil && providerSetting.ValuePlain != "" {
-		provider = providerSetting.ValuePlain
-	}
-
-	var model string
-	var modelSetting models.AppSetting
-	if err := db.DB.Where("tenant_id = ? AND setting_key = ?", tenantID, "ai_model").First(&modelSetting).Error; err == nil {
-		model = modelSetting.ValuePlain
-	}
-
-	var baseURL string
-	var baseURLSetting models.AppSetting
-	if err := db.DB.Where("tenant_id = ? AND setting_key = ?", tenantID, "ai_base_url").First(&baseURLSetting).Error; err == nil {
-		baseURL = baseURLSetting.ValuePlain
-	}
-
-	var client ai.AIProvider
-	switch provider {
-	case "claude":
-		client = ai.NewClaudeProvider(string(apiKeyBytes), model, testKeyMaxTokens, baseURL)
-	case "gemini":
-		client = ai.NewGeminiProvider(string(apiKeyBytes), model, baseURL)
-	case "openai":
-		client = ai.NewOpenAIProvider(string(apiKeyBytes), model, testKeyMaxTokens, baseURL)
-	case "xai":
-		client = ai.NewXAIProvider(string(apiKeyBytes), model, testKeyMaxTokens, baseURL)
-	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported_provider", "message": "Nhà cung cấp không được hỗ trợ: " + provider})
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), testKeyTimeout)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), aiTestTimeout(resolved))
 	defer cancel()
 
 	resp, err := client.AnalyzeChat(ctx, testKeySystemPrompt, testKeyUserMessage)
