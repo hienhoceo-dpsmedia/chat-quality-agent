@@ -1,6 +1,7 @@
 package channels
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -250,6 +251,16 @@ type chatwootAgent struct {
 
 type chatwootAgentList struct {
 	Payload []chatwootAgent `json:"payload"`
+}
+
+func (l *chatwootAgentList) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) > 0 && data[0] == '[' {
+		return json.Unmarshal(data, &l.Payload)
+	}
+	// Keep compatibility with payload-wrapped responses.
+	type envelope chatwootAgentList
+	return json.Unmarshal(data, (*envelope)(l))
 }
 
 func (c *ChatwootAdapter) ensureAgents(ctx context.Context) error {

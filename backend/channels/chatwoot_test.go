@@ -250,6 +250,95 @@ func TestChatwootFetchMessages(t *testing.T) {
 	}
 }
 
+func TestChatwootFetchMessagesAgentResponseShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"top-level array", ` [ {"id":9,"name":"Agent A","email":"a@dps.media"},{"id":10,"name":"Agent B","email":"b@dps.media"} ] `},
+		{"payload envelope", `{"payload":[{"id":9,"name":"Agent A","email":"a@dps.media"},{"id":10,"name":"Agent B","email":"b@dps.media"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agentCalls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/accounts/1/agents":
+					agentCalls++
+					fmt.Fprint(w, tc.body)
+				case "/api/v1/accounts/1/conversations/101/messages", "/api/v1/accounts/1/conversations/102/messages":
+					fmt.Fprint(w, `{"payload":[
+						{"id":501,"message_type":1,"content":"First reply","created_at":1700000100,"sender":{"id":9,"name":"Agent A","type":"user"}},
+						{"id":502,"message_type":1,"content":"Second reply","created_at":1700000200,"sender":{"id":10,"name":"Agent B","type":"user"}}
+					]}`)
+				default:
+					t.Errorf("unexpected path %s", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+
+			adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+			for _, conversationID := range []string{"101", "102"} {
+				msgs, err := adapter.FetchMessages(context.Background(), conversationID, time.Unix(1650000000, 0))
+				if err != nil {
+					t.Fatalf("FetchMessages: %v", err)
+				}
+				if len(msgs) != 2 {
+					t.Fatalf("want 2 messages, got %+v", msgs)
+				}
+				for i, email := range []string{"a@dps.media", "b@dps.media"} {
+					if msgs[i].SenderEmail != email || msgs[i].SenderExternalID != fmt.Sprint(9+i) || msgs[i].SenderType != "agent" {
+						t.Errorf("message %d: want mapped agent %s, got %+v", i, email, msgs[i])
+					}
+				}
+			}
+			if agentCalls != 1 {
+				t.Fatalf("/agents requests = %d, want 1 across conversations", agentCalls)
+			}
+		})
+	}
+}
+
+func TestChatwootFetchMessagesAgentFailureNegativeCache(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"HTTP failure", http.StatusInternalServerError, `{"error":"boom"}`},
+		{"invalid JSON", http.StatusOK, `[{`},
+		{"invalid array field", http.StatusOK, `[{"id":"invalid","email":"a@dps.media"}]`},
+		{"invalid envelope field", http.StatusOK, `{"payload":[{"id":"invalid","email":"a@dps.media"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agentCalls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v1/accounts/1/agents" {
+					agentCalls++
+					w.WriteHeader(tc.status)
+					fmt.Fprint(w, tc.body)
+					return
+				}
+				fmt.Fprint(w, `{"payload":[{"id":502,"message_type":1,"content":"Reply","created_at":1700000100,"sender":{"id":9,"name":"Agent A","type":"user"}}]}`)
+			}))
+			defer srv.Close()
+
+			adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+			for _, conversationID := range []string{"101", "102"} {
+				msgs, err := adapter.FetchMessages(context.Background(), conversationID, time.Unix(1650000000, 0))
+				if err != nil {
+					t.Fatalf("FetchMessages should degrade gracefully: %v", err)
+				}
+				if len(msgs) != 1 || msgs[0].SenderEmail != "" || msgs[0].SenderExternalID != "9" || msgs[0].SenderType != "agent" {
+					t.Fatalf("want bare agent identity after lookup failure, got %+v", msgs)
+				}
+			}
+			if agentCalls != 1 {
+				t.Fatalf("/agents requests = %d, want 1 after failure", agentCalls)
+			}
+		})
+	}
+}
+
 func TestChatwootFetchMessagesPaginates(t *testing.T) {
 	var befores []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
