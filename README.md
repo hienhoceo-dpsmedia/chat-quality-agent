@@ -1,5 +1,15 @@
 # Chat Quality Agent (CQA)
 
+## DPS fork — production Portainer
+
+Triển khai DPS trên Docker standalone + Nginx Proxy Manager hiện hữu bằng
+[`docker-compose.portainer.yml`](docker-compose.portainer.yml), theo
+[runbook production DPS](docs/deploy-portainer-dps.md) và [biến mẫu](.env.production.example).
+Domain đề xuất: `https://cqa.dps.media/` (chưa triển khai).
+Build image riêng `dps-cqa:<gitsha>` từ nhánh `feat/p0-chatwoot-sync` đã chứa đầy đủ thay đổi DPS;
+image upstream bên dưới không chứa Custom AI của fork.
+Xem [hướng dẫn Custom AI](docs/custom-ai.md) cho endpoint OpenAI-compatible và timeout.
+
 [![Docker Hub](https://img.shields.io/docker/v/buitanviet/chat-quality-agent?label=Docker%20Hub&sort=semver)](https://hub.docker.com/r/buitanviet/chat-quality-agent)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 

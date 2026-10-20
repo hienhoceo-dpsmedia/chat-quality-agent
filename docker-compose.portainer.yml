@@ -1,0 +1,88 @@
+# Standalone Docker / Portainer Web editor. Build CQA_IMAGE on the target engine first.
+services:
+  app:
+    image: ${CQA_IMAGE:?Set CQA_IMAGE to the DPS fork image built on this Docker engine}
+    container_name: cqa_app
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      APP_URL: ${APP_URL:-https://cqa.dps.media}
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8080"
+      TZ: Asia/Ho_Chi_Minh
+      DB_HOST: cqa-db
+      DB_PORT: "3306"
+      DB_NAME: ${DB_NAME:-cqa}
+      DB_USER: ${DB_USER:-cqa}
+      DB_PASSWORD: ${DB_PASSWORD:?Set a unique production DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?Set a random production JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set a stable 32-byte production ENCRYPTION_KEY}
+      RATE_LIMIT_PER_IP: ${RATE_LIMIT_PER_IP:-500}
+      RATE_LIMIT_PER_USER: ${RATE_LIMIT_PER_USER:-1000}
+    volumes:
+      - cqa_files:/var/lib/cqa/files
+    networks:
+      - proxy
+      - database
+    depends_on:
+      cqa-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  cqa-db:
+    image: mysql:8.0
+    container_name: cqa_db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-cqa}
+      MYSQL_USER: ${DB_USER:-cqa}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?Set a unique production DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set a unique production MYSQL_ROOT_PASSWORD}
+      TZ: Asia/Ho_Chi_Minh
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - cqa_mysql:/var/lib/mysql
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_PASSWORD\" mysql --protocol=TCP -h 127.0.0.1 -u\"$$MYSQL_USER\" --database=\"$$MYSQL_DATABASE\" --execute='SELECT 1' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      start_period: 300s
+      retries: 30
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  proxy:
+    external: true
+    name: nginx-proxy-manager_default
+  database:
+    internal: true
+
+volumes:
+  cqa_mysql:
+    name: dps_cqa_mysql_data
+  cqa_files:
+    name: dps_cqa_files
