@@ -56,6 +56,125 @@ func TestChatwootFetchRecentConversations(t *testing.T) {
 	}
 }
 
+func TestChatwootPagination(t *testing.T) {
+	var pages []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		pages = append(pages, page)
+		w.Header().Set("Content-Type", "application/json")
+		if page == "2" {
+			fmt.Fprint(w, `{"data":{"payload":[
+				{"id":900,"last_activity_at":1600000000,"inbox_id":7,"status":"open","meta":{"sender":{"name":"Khach cu"}}}
+			]}}`)
+			return
+		}
+		fmt.Fprint(w, `{"data":{"payload":[`)
+		for i := 0; i < 25; i++ {
+			if i > 0 {
+				fmt.Fprint(w, ",")
+			}
+			fmt.Fprintf(w, `{"id":%d,"last_activity_at":%d,"inbox_id":7,"status":"open","meta":{"sender":{"name":"Khach %d"}}}`,
+				100+i, 1700000000+i, i)
+		}
+		fmt.Fprint(w, `]}}`)
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{
+		BaseURL: srv.URL, AccountID: 1, APIToken: "token-1", InboxIDs: []int{7},
+	})
+	got, err := adapter.FetchRecentConversations(context.Background(), time.Unix(1650000000, 0), 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 25 {
+		t.Fatalf("want 25 conversations, got %d", len(got))
+	}
+	if len(pages) != 2 || pages[0] != "1" || pages[1] != "2" {
+		t.Fatalf("pages requested = %v, want [1 2]", pages)
+	}
+}
+
+func TestChatwootLimitPerInbox(t *testing.T) {
+	observed := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inbox := r.URL.Query().Get("inbox_id")
+		observed[inbox] = true
+		id := 100
+		if inbox == "8" {
+			id = 200
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"data":{"payload":[
+			{"id":%d,"last_activity_at":1700000100,"inbox_id":%s,"status":"open","meta":{"sender":{"name":"Khach %s"}}},
+			{"id":%d,"last_activity_at":1700000050,"inbox_id":%s,"status":"open","meta":{"sender":{"name":"Khach %s"}}}
+		]}}`, id, inbox, inbox, id+1, inbox, inbox)
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{
+		BaseURL: srv.URL, AccountID: 1, APIToken: "token-1", InboxIDs: []int{7, 8},
+	})
+	got, err := adapter.FetchRecentConversations(context.Background(), time.Unix(1650000000, 0), 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 conversations (one per inbox), got %d", len(got))
+	}
+	if !observed["7"] || !observed["8"] {
+		t.Fatalf("inboxes observed = %v, want 7 and 8", observed)
+	}
+}
+
+func TestChatwootSkipsZeroTimestamp(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":{"payload":[
+			{"id":200,"last_activity_at":0,"inbox_id":7,"status":"open","meta":{"sender":{"name":"Khong co moc"}}},
+			{"id":201,"last_activity_at":1700000200,"inbox_id":7,"status":"open","meta":{"sender":{"name":"Khach B"}}}
+		]}}`)
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{
+		BaseURL: srv.URL, AccountID: 1, APIToken: "token-1", InboxIDs: []int{7},
+	})
+	got, err := adapter.FetchRecentConversations(context.Background(), time.Unix(1650000000, 0), 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].ExternalID != "201" {
+		t.Fatalf("want only conversation 201, got %+v", got)
+	}
+}
+
+func TestChatwootPartialInboxFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("inbox_id") == "7" {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"error":"boom"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":{"payload":[
+			{"id":301,"last_activity_at":1700000200,"inbox_id":8,"status":"open","meta":{"sender":{"name":"Khach C"}}}
+		]}}`)
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{
+		BaseURL: srv.URL, AccountID: 1, APIToken: "token-1", InboxIDs: []int{7, 8},
+	})
+	got, err := adapter.FetchRecentConversations(context.Background(), time.Unix(1650000000, 0), 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].ExternalID != "301" {
+		t.Fatalf("want conversation 301 from healthy inbox, got %+v", got)
+	}
+}
+
 func TestChatwootHealthCheck(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/accounts/1" {
@@ -68,5 +187,17 @@ func TestChatwootHealthCheck(t *testing.T) {
 	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
 	if err := adapter.HealthCheck(context.Background()); err != nil {
 		t.Fatalf("health check failed: %v", err)
+	}
+}
+
+func TestChatwootHealthCheckFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":"Unauthorized"}`)
+	}))
+	defer srv.Close()
+	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "bad"})
+	if err := adapter.HealthCheck(context.Background()); err == nil {
+		t.Fatal("want error for 401 response, got nil")
 	}
 }

@@ -5,12 +5,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	// Chatwoot trả 25 hội thoại mỗi trang khi không truyền per_page.
+	chatwootPageSize = 25
+
+	// Giới hạn phần thân lỗi để log không phình to.
+	chatwootMaxErrorBody = 512
 )
 
 type ChatwootCredentials struct {
@@ -59,7 +68,7 @@ func (c *ChatwootAdapter) doJSON(ctx context.Context, method, target string, out
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("chatwoot %s %s: status %d: %s", method, target, resp.StatusCode, string(body))
+		return fmt.Errorf("chatwoot %s %s: status %d: %s", method, target, resp.StatusCode, errorBody(body))
 	}
 	if out == nil {
 		return nil
@@ -67,8 +76,17 @@ func (c *ChatwootAdapter) doJSON(ctx context.Context, method, target string, out
 	return json.Unmarshal(body, out)
 }
 
+// errorBody cắt ngắn phần thân phản hồi lỗi của Chatwoot.
+func errorBody(body []byte) string {
+	if len(body) > chatwootMaxErrorBody {
+		return string(body[:chatwootMaxErrorBody]) + "..."
+	}
+	return string(body)
+}
+
 type chatwootConversation struct {
-	ID             int    `json:"id"`
+	// API trả id là display_id (jbuilder ghi đè), không phải id nội bộ.
+	DisplayID      int    `json:"id"`
 	LastActivityAt int64  `json:"last_activity_at"`
 	InboxID        int    `json:"inbox_id"`
 	Status         string `json:"status"`
@@ -91,6 +109,10 @@ type chatwootConversationList struct {
 	} `json:"data"`
 }
 
+// FetchRecentConversations lấy hội thoại hoạt động kể từ `since`.
+// `limit` là giới hạn cho MỖI inbox, không phải tổng; limit <= 0 nghĩa là 100.
+// Lỗi ở một inbox không làm hỏng cả lượt đồng bộ: inbox đó dừng lại và các
+// inbox còn lại vẫn được lấy.
 func (c *ChatwootAdapter) FetchRecentConversations(ctx context.Context, since time.Time, limit int) ([]SyncedConversation, error) {
 	if limit <= 0 {
 		limit = 100
@@ -101,7 +123,9 @@ func (c *ChatwootAdapter) FetchRecentConversations(ctx context.Context, since ti
 	}
 	seen := map[int]bool{}
 	out := make([]SyncedConversation, 0, limit)
+	var lastErr error
 	for _, inboxID := range inboxes {
+		collected := 0
 		for page := 1; ; page++ {
 			q := url.Values{
 				"status":  {"all"},
@@ -113,30 +137,51 @@ func (c *ChatwootAdapter) FetchRecentConversations(ctx context.Context, since ti
 			}
 			var resp chatwootConversationList
 			if err := c.doJSON(ctx, http.MethodGet, c.url("/conversations", q), &resp); err != nil {
-				return nil, err
+				lastErr = fmt.Errorf("chatwoot conversations inbox %d page %d: %w", inboxID, page, err)
+				log.Printf("[chatwoot] inbox %d page %d: %v", inboxID, page, err)
+				break
 			}
-			if len(resp.Data.Payload) == 0 {
+			payload := resp.Data.Payload
+			if len(payload) == 0 {
 				break
 			}
 			olderFound := false
-			for _, conv := range resp.Data.Payload {
-				if conv.LastActivityAt > 0 && time.Unix(conv.LastActivityAt, 0).Before(since) {
+			added := 0
+			for _, conv := range payload {
+				// Bỏ hội thoại chưa có mốc hoạt động thay vì ghi mốc 1970.
+				if conv.LastActivityAt <= 0 {
+					continue
+				}
+				if time.Unix(conv.LastActivityAt, 0).Before(since) {
 					olderFound = true
 					break
 				}
-				if seen[conv.ID] {
+				if seen[conv.DisplayID] {
 					continue
 				}
-				seen[conv.ID] = true
+				seen[conv.DisplayID] = true
 				out = append(out, toSyncedConversation(conv))
-				if len(out) >= limit {
-					return out, nil
+				added++
+				collected++
+				if collected >= limit {
+					break
 				}
 			}
-			if olderFound || len(resp.Data.Payload) < 25 {
+			if collected >= limit || olderFound {
+				break
+			}
+			if len(payload) < chatwootPageSize {
+				break
+			}
+			// Trang đầy nhưng không thêm hội thoại mới: máy chủ đang bỏ qua
+			// tham số page, dừng để tránh lặp vô hạn.
+			if added == 0 {
 				break
 			}
 		}
+	}
+	if len(out) == 0 && lastErr != nil {
+		return nil, lastErr
 	}
 	return out, nil
 }
@@ -153,7 +198,7 @@ func toSyncedConversation(conv chatwootConversation) SyncedConversation {
 		meta["team"] = conv.Meta.Team.Name
 	}
 	return SyncedConversation{
-		ExternalID:    strconv.Itoa(conv.ID),
+		ExternalID:    strconv.Itoa(conv.DisplayID),
 		CustomerName:  conv.Meta.Sender.Name,
 		LastMessageAt: time.Unix(conv.LastActivityAt, 0),
 		Metadata:      meta,
@@ -161,5 +206,8 @@ func toSyncedConversation(conv chatwootConversation) SyncedConversation {
 }
 
 func (c *ChatwootAdapter) HealthCheck(ctx context.Context) error {
-	return c.doJSON(ctx, http.MethodGet, c.url("", nil), nil)
+	var account struct {
+		ID int `json:"id"`
+	}
+	return c.doJSON(ctx, http.MethodGet, c.url("", nil), &account)
 }
