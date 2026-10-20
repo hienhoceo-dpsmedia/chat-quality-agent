@@ -31,7 +31,7 @@ import (
 var httpClientWithTimeout = &http.Client{Timeout: 30 * time.Second}
 
 type CreateChannelRequest struct {
-	ChannelType string          `json:"channel_type" binding:"required,oneof=zalo_oa facebook pancake"`
+	ChannelType string          `json:"channel_type" binding:"required,oneof=zalo_oa facebook pancake chatwoot"`
 	Name        string          `json:"name" binding:"required,min=2,max=255"`
 	Credentials json.RawMessage `json:"credentials" binding:"required"` // JSON: varies by type
 	Metadata    string          `json:"metadata"`
@@ -155,6 +155,21 @@ func CreateChannel(c *gin.Context) {
 		externalID = pkCreds.PageID
 	}
 
+	if req.ChannelType == "chatwoot" {
+		var cwCreds channels.ChatwootCredentials
+		if err := json.Unmarshal(req.Credentials, &cwCreds); err != nil || cwCreds.BaseURL == "" || cwCreds.AccountID == 0 || cwCreds.APIToken == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "chatwoot_credentials_required"})
+			return
+		}
+		adapter := channels.NewChatwootAdapter(cwCreds)
+		if err := adapter.HealthCheck(c.Request.Context()); err != nil {
+			log.Printf("[channels] chatwoot health check failed: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "chatwoot_connection_failed"})
+			return
+		}
+		externalID = strconv.Itoa(cwCreds.AccountID)
+	}
+
 	now := time.Now()
 	channel := models.Channel{
 		ID:                   pkg.NewUUID(),
@@ -164,9 +179,14 @@ func CreateChannel(c *gin.Context) {
 		ExternalID:           externalID,
 		CredentialsEncrypted: credentialsToStore,
 		IsActive:             true,
-		Metadata:             func() string { if req.Metadata != "" { return req.Metadata }; return "{}" }(),
-		CreatedAt:            now,
-		UpdatedAt:            now,
+		Metadata: func() string {
+			if req.Metadata != "" {
+				return req.Metadata
+			}
+			return "{}"
+		}(),
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 
 	if err := db.DB.Create(&channel).Error; err != nil {
@@ -452,7 +472,7 @@ type zaloTokenResponse struct {
 	AccessToken  string          `json:"access_token"`
 	RefreshToken string          `json:"refresh_token"`
 	ExpiresIn    json.RawMessage `json:"expires_in"` // Zalo returns string or int
-	Error        json.RawMessage `json:"error"`       // can be int or string
+	Error        json.RawMessage `json:"error"`      // can be int or string
 	Message      string          `json:"message"`
 }
 
@@ -531,8 +551,8 @@ func fetchZaloOAInfo(accessToken string) (*zaloOAInfo, error) {
 		Error   int    `json:"error"`
 		Message string `json:"message"`
 		Data    struct {
-			OAID   string `json:"oa_id"`
-			Name   string `json:"name"`
+			OAID string `json:"oa_id"`
+			Name string `json:"name"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {

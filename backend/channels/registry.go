@@ -26,6 +26,12 @@ func NewAdapter(channelType string, credentialsJSON []byte) (ChannelAdapter, err
 			return nil, fmt.Errorf("invalid pancake credentials: %w", err)
 		}
 		return NewPancakeAdapter(creds), nil
+	case "chatwoot":
+		var creds ChatwootCredentials
+		if err := json.Unmarshal(credentialsJSON, &creds); err != nil {
+			return nil, fmt.Errorf("invalid chatwoot credentials: %w", err)
+		}
+		return NewChatwootAdapter(creds), nil
 	default:
 		return nil, fmt.Errorf("unsupported channel type: %s", channelType)
 	}

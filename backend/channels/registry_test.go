@@ -26,6 +26,16 @@ func TestNewAdapterFacebook(t *testing.T) {
 	}
 }
 
+func TestNewAdapterChatwoot(t *testing.T) {
+	adapter, err := NewAdapter("chatwoot", []byte(`{"base_url":"http://chatwoot-web:3000","account_id":1,"api_token":"t"}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := adapter.(*ChatwootAdapter); !ok {
+		t.Fatalf("want *ChatwootAdapter, got %T", adapter)
+	}
+}
+
 func TestNewAdapterUnsupported(t *testing.T) {
 	_, err := NewAdapter("whatsapp", []byte("{}"))
 	if err == nil {
