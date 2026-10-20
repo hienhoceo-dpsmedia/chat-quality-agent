@@ -36,7 +36,7 @@ func TestChatwootFetchRecentConversations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gotInbox != "7" || gotStatus != "all" || gotSort != "last_activity_at" {
+	if gotInbox != "7" || gotStatus != "all" || gotSort != "last_activity_at_desc" {
 		t.Fatalf("query = inbox:%q status:%q sort:%q", gotInbox, gotStatus, gotSort)
 	}
 	if len(got) != 1 {
@@ -47,6 +47,12 @@ func TestChatwootFetchRecentConversations(t *testing.T) {
 	}
 	if got[0].Metadata["inbox_id"] != float64(7) && got[0].Metadata["inbox_id"] != 7 {
 		t.Fatalf("missing inbox metadata: %+v", got[0].Metadata)
+	}
+	if !got[0].LastMessageAt.Equal(time.Unix(1700000200, 0)) {
+		t.Fatalf("LastMessageAt = %v, want %v", got[0].LastMessageAt, time.Unix(1700000200, 0))
+	}
+	if got[0].Metadata["status"] != "open" {
+		t.Fatalf("status metadata = %v, want open", got[0].Metadata["status"])
 	}
 }
 

@@ -105,7 +105,7 @@ func (c *ChatwootAdapter) FetchRecentConversations(ctx context.Context, since ti
 		for page := 1; ; page++ {
 			q := url.Values{
 				"status":  {"all"},
-				"sort_by": {"last_activity_at"},
+				"sort_by": {"last_activity_at_desc"},
 				"page":    {strconv.Itoa(page)},
 			}
 			if inboxID > 0 {
