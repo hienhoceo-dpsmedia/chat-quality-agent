@@ -10,6 +10,7 @@ type Message struct {
 	SenderType        string    `gorm:"type:varchar(20);not null" json:"sender_type"` // customer | agent | system
 	SenderName        string    `gorm:"type:varchar(500)" json:"sender_name"`
 	SenderExternalID  string    `gorm:"type:varchar(255)" json:"sender_external_id"`
+	SenderEmail       string    `gorm:"type:varchar(255)" json:"sender_email"`
 	Content           string    `gorm:"type:text" json:"content"`
 	ContentType       string    `gorm:"type:varchar(50);default:'text'" json:"content_type"` // text | image | file | sticker
 	Attachments       string    `gorm:"type:json" json:"attachments"`

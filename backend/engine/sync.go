@@ -270,6 +270,8 @@ func (s *SyncEngine) upsertMessage(tenantID, conversationID string, msg channels
 		ExternalMessageID: msg.ExternalID,
 		SenderType:        msg.SenderType,
 		SenderName:        msg.SenderName,
+		SenderExternalID:  msg.SenderExternalID,
+		SenderEmail:       msg.SenderEmail,
 		Content:           msg.Content,
 		ContentType:       msg.ContentType,
 		Attachments:       string(attachmentsJSON),
