@@ -177,10 +177,10 @@ Trong tenant → Cài đặt → Cấu hình AI → **Custom AI — OpenAI-compa
 - Timeout: mặc định **120 giây**, tùy chọn số nguyên **5–600 giây**.
 - Bấm **Kiểm tra kết nối** rồi **Lưu cài đặt**.
 
-Endpoint `*.ts.net` này thuộc mạng riêng: VPS cần được cấp quyền Tailscale/tailnet và container app
-cần DNS, route, firewall/ACL cho phép truy cập endpoint. VPS truy cập được chưa đủ nếu Docker
-forwarding/DNS chặn container. Thành công local không chứng minh production truy cập được.
-Không mở public dịch vụ tailnet để khắc phục lỗi route.
+Nếu endpoint `*.ts.net` này chỉ được mở trong tailnet, VPS cần quyền Tailscale/tailnet và container app
+cần DNS, route, firewall/ACL cho phép truy cập. Tên miền `*.ts.net` tự nó không xác nhận endpoint
+riêng hay đã được publish qua Funnel; kiểm tra theo cấu hình máy chủ thực tế. VPS truy cập được chưa đủ
+nếu Docker forwarding/DNS chặn container. Thành công local không chứng minh production truy cập được.
 
 Kiểm tra từ VPS và **từ chính app container** (thêm Authorization theo server nếu cần):
 
