@@ -1,10 +1,13 @@
 package channels
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -199,5 +202,141 @@ func TestChatwootHealthCheckFailure(t *testing.T) {
 	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "bad"})
 	if err := adapter.HealthCheck(context.Background()); err == nil {
 		t.Fatal("want error for 401 response, got nil")
+	}
+}
+
+func TestChatwootFetchMessages(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/agents":
+			fmt.Fprint(w, `{"payload":[{"id":9,"name":"Nhan vien A","email":"a@dps.media"}]}`)
+		case "/api/v1/accounts/1/conversations/101/messages":
+			if r.URL.Query().Get("filter_internal_messages") != "1" {
+				t.Errorf("missing filter_internal_messages")
+			}
+			fmt.Fprint(w, `{"payload":[
+				{"id":501,"message_type":0,"private":false,"content":"Em chao anh","content_type":"text","created_at":1700000000,
+				 "sender":{"id":77,"name":"Khach A","type":"contact"}},
+				{"id":502,"message_type":1,"private":false,"content":"Da em nghe","content_type":"text","created_at":1700000100,
+				 "sender":{"id":9,"name":"Nhan vien A","type":"user"}},
+				{"id":503,"message_type":2,"private":false,"content":"assigned","content_type":"text","created_at":1700000200,
+				 "sender":{"id":1,"name":"System","type":"user"}},
+				{"id":504,"message_type":1,"private":true,"content":"note rieng","content_type":"text","created_at":1700000300,
+				 "sender":{"id":9,"name":"Nhan vien A","type":"user"}}
+			]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+	msgs, err := adapter.FetchMessages(context.Background(), "101", time.Unix(1650000000, 0))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 kept messages, got %d: %+v", len(msgs), msgs)
+	}
+	if msgs[0].SenderExternalID != "77" || msgs[0].SenderType != "customer" {
+		t.Fatalf("bad customer map: %+v", msgs[0])
+	}
+	if msgs[1].SenderExternalID != "9" || msgs[1].SenderType != "agent" || msgs[1].SenderEmail != "a@dps.media" {
+		t.Fatalf("bad agent map: %+v", msgs[1])
+	}
+	if msgs[0].ExternalID != "501" || msgs[1].ExternalID != "502" {
+		t.Fatalf("messages not chronological: %+v", msgs)
+	}
+}
+
+func TestChatwootFetchMessagesPaginates(t *testing.T) {
+	var befores []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/agents":
+			fmt.Fprint(w, `{"payload":[]}`)
+		case "/api/v1/accounts/1/conversations/101/messages":
+			before := r.URL.Query().Get("before")
+			befores = append(befores, before)
+			fmt.Fprint(w, `{"payload":[`)
+			if before == "" {
+				for i := 501; i <= 520; i++ {
+					if i > 501 {
+						fmt.Fprint(w, ",")
+					}
+					fmt.Fprintf(w, `{"id":%d,"message_type":0,"private":false,"content":"m%d","content_type":"text","created_at":%d,"sender":{"id":77,"name":"Khach A","type":"contact"}}`,
+						i, i, 1700000000+i)
+				}
+			} else {
+				fmt.Fprint(w, `{"id":500,"message_type":0,"private":false,"content":"m500","content_type":"text","created_at":1699999500,"sender":{"id":77,"name":"Khach A","type":"contact"}}`)
+			}
+			fmt.Fprint(w, `]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+	msgs, err := adapter.FetchMessages(context.Background(), "101", time.Unix(1650000000, 0))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(befores) != 2 || befores[0] != "" || befores[1] != "501" {
+		t.Fatalf("requests before = %v, want [\"\" \"501\"]", befores)
+	}
+	if len(msgs) != 21 {
+		t.Fatalf("want 21 messages, got %d", len(msgs))
+	}
+	if msgs[0].ExternalID != "500" {
+		t.Fatalf("first message = %s, want 500", msgs[0].ExternalID)
+	}
+	if msgs[len(msgs)-1].ExternalID != "520" {
+		t.Fatalf("last message = %s, want 520", msgs[len(msgs)-1].ExternalID)
+	}
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i-1].SentAt.After(msgs[i].SentAt) {
+			t.Fatalf("messages not ascending at %d: %v after %v", i, msgs[i-1].SentAt, msgs[i].SentAt)
+		}
+	}
+}
+
+func TestChatwootFetchMessagesAgentLookupFails(t *testing.T) {
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/agents":
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"error":"boom"}`)
+		case "/api/v1/accounts/1/conversations/101/messages":
+			fmt.Fprint(w, `{"payload":[
+				{"id":502,"message_type":1,"private":false,"content":"Da em nghe","content_type":"text","created_at":1700000100,
+				 "sender":{"id":9,"name":"Nhan vien A","type":"user"}}
+			]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+	msgs, err := adapter.FetchMessages(context.Background(), "101", time.Unix(1650000000, 0))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message, got %d", len(msgs))
+	}
+	if msgs[0].SenderEmail != "" {
+		t.Fatalf("SenderEmail = %q, want empty", msgs[0].SenderEmail)
+	}
+	if msgs[0].SenderType != "agent" {
+		t.Fatalf("SenderType = %q, want agent", msgs[0].SenderType)
+	}
+	if logBuf.Len() == 0 {
+		t.Fatal("want a log line about the agent lookup failure")
 	}
 }

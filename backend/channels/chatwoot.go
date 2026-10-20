@@ -18,6 +18,9 @@ const (
 	// Chatwoot trả 25 hội thoại mỗi trang khi không truyền per_page.
 	chatwootPageSize = 25
 
+	// Chatwoot trả 20 tin nhắn mỗi trang, kể cả khi truyền `before`.
+	chatwootMessagePageSize = 20
+
 	// Giới hạn phần thân lỗi để log không phình to.
 	chatwootMaxErrorBody = 512
 )
@@ -210,4 +213,147 @@ func (c *ChatwootAdapter) HealthCheck(ctx context.Context) error {
 		ID int `json:"id"`
 	}
 	return c.doJSON(ctx, http.MethodGet, c.url("", nil), &account)
+}
+
+type chatwootMessage struct {
+	ID          int    `json:"id"`
+	MessageType int    `json:"message_type"`
+	Private     bool   `json:"private"`
+	Content     string `json:"content"`
+	ContentType string `json:"content_type"`
+	CreatedAt   int64  `json:"created_at"`
+	Sender      *struct {
+		ID    int    `json:"id"`
+		Name  string `json:"name"`
+		Email string `json:"email"`
+		Type  string `json:"type"`
+	} `json:"sender"`
+	Attachments []struct {
+		DataURL   string `json:"data_url"`
+		FileType  string `json:"file_type"`
+		Extension string `json:"extension"`
+	} `json:"attachments"`
+}
+
+type chatwootMessageList struct {
+	Payload []chatwootMessage `json:"payload"`
+}
+
+type chatwootAgent struct {
+	ID    int    `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+type chatwootAgentList struct {
+	Payload []chatwootAgent `json:"payload"`
+}
+
+func (c *ChatwootAdapter) ensureAgents(ctx context.Context) error {
+	c.agentMu.Lock()
+	defer c.agentMu.Unlock()
+	if len(c.agents) > 0 {
+		return nil
+	}
+	var resp chatwootAgentList
+	if err := c.doJSON(ctx, http.MethodGet, c.url("/agents", nil), &resp); err != nil {
+		return err
+	}
+	for _, a := range resp.Payload {
+		c.agents[a.ID] = a.Email
+	}
+	return nil
+}
+
+func (c *ChatwootAdapter) FetchMessages(ctx context.Context, conversationID string, since time.Time) ([]SyncedMessage, error) {
+	if err := c.ensureAgents(ctx); err != nil {
+		log.Printf("[chatwoot] load agents failed (falling back to sender ids): %v", err)
+	}
+	before := 0
+	out := make([]SyncedMessage, 0, 20)
+	for {
+		q := url.Values{"filter_internal_messages": {"1"}}
+		if before > 0 {
+			q.Set("before", strconv.Itoa(before))
+		}
+		target := c.url("/conversations/"+conversationID+"/messages", q)
+		var resp chatwootMessageList
+		if err := c.doJSON(ctx, http.MethodGet, target, &resp); err != nil {
+			return nil, fmt.Errorf("chatwoot messages %s: %w", conversationID, err)
+		}
+		if len(resp.Payload) == 0 {
+			break
+		}
+		oldest := int64(0)
+		minID := 0
+		pageMsgs := make([]SyncedMessage, 0, len(resp.Payload))
+		for _, m := range resp.Payload {
+			if minID == 0 || m.ID < minID {
+				minID = m.ID
+			}
+			if oldest == 0 || m.CreatedAt < oldest {
+				oldest = m.CreatedAt
+			}
+			if m.MessageType != 0 && m.MessageType != 1 {
+				continue
+			}
+			if m.Private {
+				continue
+			}
+			if m.CreatedAt > 0 && time.Unix(m.CreatedAt, 0).Before(since) {
+				continue
+			}
+			pageMsgs = append(pageMsgs, c.toSyncedMessage(m))
+		}
+		// Chatwoot trả mỗi trang theo thứ tự tăng dần; trang mới hơn đứng trước.
+		out = append(pageMsgs, out...)
+		if len(resp.Payload) < chatwootMessagePageSize {
+			break
+		}
+		if oldest > 0 && time.Unix(oldest, 0).Before(since) {
+			break
+		}
+		if minID == 0 || minID == before {
+			break
+		}
+		before = minID
+	}
+	return out, nil
+}
+
+func (c *ChatwootAdapter) toSyncedMessage(m chatwootMessage) SyncedMessage {
+	msg := SyncedMessage{
+		ExternalID:  strconv.Itoa(m.ID),
+		SenderType:  "system",
+		Content:     m.Content,
+		ContentType: m.ContentType,
+		SentAt:      time.Unix(m.CreatedAt, 0),
+		RawData:     map[string]interface{}{"message_type": m.MessageType},
+	}
+	if m.Sender != nil {
+		msg.SenderExternalID = strconv.Itoa(m.Sender.ID)
+		msg.SenderName = m.Sender.Name
+		switch m.Sender.Type {
+		case "user":
+			msg.SenderType = "agent"
+			c.agentMu.Lock()
+			msg.SenderEmail = c.agents[m.Sender.ID]
+			c.agentMu.Unlock()
+		case "contact":
+			msg.SenderType = "customer"
+			msg.SenderEmail = m.Sender.Email
+		}
+	}
+	for _, a := range m.Attachments {
+		kind := "file"
+		if strings.HasPrefix(a.FileType, "image") {
+			kind = "image"
+		}
+		msg.Attachments = append(msg.Attachments, Attachment{
+			Type: kind,
+			URL:  a.DataURL,
+			Name: a.Extension,
+		})
+	}
+	return msg
 }
