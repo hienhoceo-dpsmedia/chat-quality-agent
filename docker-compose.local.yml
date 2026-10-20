@@ -1,10 +1,14 @@
+name: cqa-local
+
 services:
   app:
     build: .
-    container_name: cqa-app
+    container_name: cqa-local-app
     restart: unless-stopped
     env_file:
       - .env
+    # APP_ENV=production is intentional: the image serves the built SPA only in
+    # production mode, and this value overrides the same key from .env.
     environment:
       - APP_ENV=production
       - DB_HOST=db
@@ -23,7 +27,7 @@ services:
 
   db:
     image: mysql:8.0
-    container_name: cqa-db
+    container_name: cqa-local-db
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
@@ -33,10 +37,11 @@ services:
     volumes:
       - cqa_mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 60s
     command: >
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_unicode_ci
@@ -44,7 +49,9 @@ services:
 
 volumes:
   cqa_mysql_data:
+    name: chat-quality-agent_cqa_mysql_data
   cqa_file_storage:
+    name: chat-quality-agent_cqa_file_storage
 
 networks:
   local-proxy:
