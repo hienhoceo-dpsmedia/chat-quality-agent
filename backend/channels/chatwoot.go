@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,8 +37,9 @@ type ChatwootAdapter struct {
 	creds  ChatwootCredentials
 	client *http.Client
 
-	agentMu sync.Mutex
-	agents  map[int]string // chatwoot user id -> email
+	agentMu      sync.Mutex
+	agents       map[int]string // chatwoot user id -> email
+	agentsLoaded bool
 }
 
 func NewChatwootAdapter(creds ChatwootCredentials) *ChatwootAdapter {
@@ -229,6 +231,7 @@ type chatwootMessage struct {
 		Type  string `json:"type"`
 	} `json:"sender"`
 	Attachments []struct {
+		ID        int    `json:"id"`
 		DataURL   string `json:"data_url"`
 		FileType  string `json:"file_type"`
 		Extension string `json:"extension"`
@@ -251,24 +254,34 @@ type chatwootAgentList struct {
 
 func (c *ChatwootAdapter) ensureAgents(ctx context.Context) error {
 	c.agentMu.Lock()
-	defer c.agentMu.Unlock()
-	if len(c.agents) > 0 {
+	if c.agentsLoaded {
+		c.agentMu.Unlock()
 		return nil
 	}
+	c.agentMu.Unlock()
+
 	var resp chatwootAgentList
 	if err := c.doJSON(ctx, http.MethodGet, c.url("/agents", nil), &resp); err != nil {
-		return err
+		// Negative cache: degrade to bare sender ids for this adapter instead of
+		// retrying /agents on every conversation.
+		log.Printf("[chatwoot] load agents failed (falling back to sender ids): %v", err)
+		c.agentMu.Lock()
+		c.agentsLoaded = true
+		c.agentMu.Unlock()
+		return nil
 	}
+
+	c.agentMu.Lock()
 	for _, a := range resp.Payload {
 		c.agents[a.ID] = a.Email
 	}
+	c.agentsLoaded = true
+	c.agentMu.Unlock()
 	return nil
 }
 
 func (c *ChatwootAdapter) FetchMessages(ctx context.Context, conversationID string, since time.Time) ([]SyncedMessage, error) {
-	if err := c.ensureAgents(ctx); err != nil {
-		log.Printf("[chatwoot] load agents failed (falling back to sender ids): %v", err)
-	}
+	c.ensureAgents(ctx)
 	before := 0
 	out := make([]SyncedMessage, 0, 20)
 	for {
@@ -300,7 +313,10 @@ func (c *ChatwootAdapter) FetchMessages(ctx context.Context, conversationID stri
 			if m.Private {
 				continue
 			}
-			if m.CreatedAt > 0 && time.Unix(m.CreatedAt, 0).Before(since) {
+			if m.CreatedAt <= 0 {
+				continue
+			}
+			if time.Unix(m.CreatedAt, 0).Before(since) {
 				continue
 			}
 			pageMsgs = append(pageMsgs, c.toSyncedMessage(m))
@@ -344,16 +360,42 @@ func (c *ChatwootAdapter) toSyncedMessage(m chatwootMessage) SyncedMessage {
 			msg.SenderEmail = m.Sender.Email
 		}
 	}
+	// Chatwoot `data_url` là URL có chữ ký và hết hạn, nên bước sync file phải
+	// tải xuống sớm thay vì lưu URL để dùng lại sau.
 	for _, a := range m.Attachments {
+		if a.DataURL == "" {
+			continue
+		}
 		kind := "file"
-		if strings.HasPrefix(a.FileType, "image") {
+		switch {
+		case strings.HasPrefix(a.FileType, "image"):
 			kind = "image"
+		case strings.HasPrefix(a.FileType, "video"):
+			kind = "video"
 		}
 		msg.Attachments = append(msg.Attachments, Attachment{
 			Type: kind,
 			URL:  a.DataURL,
-			Name: a.Extension,
+			Name: attachmentName(a.ID, a.Extension, a.DataURL),
 		})
 	}
 	return msg
+}
+
+// attachmentName tạo tên file duy nhất trong phạm vi hội thoại: mỗi tệp đính
+// kèm phải có khóa lưu trữ riêng, nếu chỉ dùng phần mở rộng thì các tệp cùng
+// loại sẽ ghi đè lên nhau.
+func attachmentName(id int, extension, dataURL string) string {
+	if id > 0 {
+		if extension != "" {
+			return fmt.Sprintf("%d.%s", id, extension)
+		}
+		return strconv.Itoa(id)
+	}
+	if u, err := url.Parse(dataURL); err == nil {
+		if base := path.Base(u.Path); base != "" && base != "." && base != "/" {
+			return base
+		}
+	}
+	return "attachment"
 }

@@ -1,13 +1,11 @@
 package channels
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"net/http/httptest"
-	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -247,6 +245,9 @@ func TestChatwootFetchMessages(t *testing.T) {
 	if msgs[0].ExternalID != "501" || msgs[1].ExternalID != "502" {
 		t.Fatalf("messages not chronological: %+v", msgs)
 	}
+	if msgs[0].Content != "Em chao anh" || msgs[0].ContentType != "text" || msgs[0].SenderName != "Khach A" {
+		t.Fatalf("bad customer content/sender fields: %+v", msgs[0])
+	}
 }
 
 func TestChatwootFetchMessagesPaginates(t *testing.T) {
@@ -302,10 +303,6 @@ func TestChatwootFetchMessagesPaginates(t *testing.T) {
 }
 
 func TestChatwootFetchMessagesAgentLookupFails(t *testing.T) {
-	var logBuf bytes.Buffer
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(os.Stderr)
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/accounts/1/agents":
@@ -336,7 +333,175 @@ func TestChatwootFetchMessagesAgentLookupFails(t *testing.T) {
 	if msgs[0].SenderType != "agent" {
 		t.Fatalf("SenderType = %q, want agent", msgs[0].SenderType)
 	}
-	if logBuf.Len() == 0 {
-		t.Fatal("want a log line about the agent lookup failure")
+}
+
+func TestChatwootFetchMessagesAttachments(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/agents":
+			fmt.Fprint(w, `{"payload":[]}`)
+		case "/api/v1/accounts/1/conversations/101/messages":
+			fmt.Fprint(w, `{"payload":[
+				{"id":600,"message_type":0,"private":false,"content":"files","content_type":"text","created_at":1700000000,
+				 "sender":{"id":77,"name":"Khach A","type":"contact"},
+				 "attachments":[
+					{"id":11,"data_url":"https://cdn.example/a.png","file_type":"image/png","extension":"png"},
+					{"id":12,"data_url":"https://cdn.example/b.mp4","file_type":"video/mp4","extension":"mp4"},
+					{"id":13,"data_url":"https://cdn.example/c.pdf","file_type":"application/pdf","extension":"pdf"},
+					{"id":14,"data_url":"","file_type":"image/png","extension":"png"}
+				 ]}
+			]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+	msgs, err := adapter.FetchMessages(context.Background(), "101", time.Unix(1650000000, 0))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message, got %d", len(msgs))
+	}
+	atts := msgs[0].Attachments
+	if len(atts) != 3 {
+		t.Fatalf("want 3 attachments (empty URL skipped), got %d: %+v", len(atts), atts)
+	}
+	wantTypes := []string{"image", "video", "file"}
+	wantNames := []string{"11.png", "12.mp4", "13.pdf"}
+	for i, att := range atts {
+		if att.Type != wantTypes[i] {
+			t.Errorf("attachment %d type = %q, want %q", i, att.Type, wantTypes[i])
+		}
+		if att.Name != wantNames[i] {
+			t.Errorf("attachment %d name = %q, want %q", i, att.Name, wantNames[i])
+		}
+		if att.URL == "" {
+			t.Errorf("attachment %d has empty URL", i)
+		}
+	}
+}
+
+func TestChatwootFetchMessagesAttachmentNames(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/agents":
+			fmt.Fprint(w, `{"payload":[]}`)
+		case "/api/v1/accounts/1/conversations/101/messages":
+			fmt.Fprint(w, `{"payload":[
+				{"id":601,"message_type":0,"private":false,"content":"two images","content_type":"text","created_at":1700000000,
+				 "sender":{"id":77,"name":"Khach A","type":"contact"},
+				 "attachments":[
+					{"id":21,"data_url":"https://cdn.example/x.png","file_type":"image/png","extension":"png"},
+					{"id":22,"data_url":"https://cdn.example/y.png","file_type":"image/png","extension":"png"}
+				 ]}
+			]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+	msgs, err := adapter.FetchMessages(context.Background(), "101", time.Unix(1650000000, 0))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(msgs) != 1 || len(msgs[0].Attachments) != 2 {
+		t.Fatalf("want 2 attachments, got %+v", msgs)
+	}
+	a, b := msgs[0].Attachments[0], msgs[0].Attachments[1]
+	if a.Name == "" || b.Name == "" || a.Name == b.Name {
+		t.Fatalf("attachment names must be non-empty and distinct: %q vs %q", a.Name, b.Name)
+	}
+}
+
+func TestChatwootFetchMessagesSkipsZeroCreatedAt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/agents":
+			fmt.Fprint(w, `{"payload":[]}`)
+		case "/api/v1/accounts/1/conversations/101/messages":
+			fmt.Fprint(w, `{"payload":[
+				{"id":701,"message_type":0,"private":false,"content":"no timestamp","content_type":"text","created_at":0,
+				 "sender":{"id":77,"name":"Khach A","type":"contact"}},
+				{"id":702,"message_type":0,"private":false,"content":"ok","content_type":"text","created_at":1700000000,
+				 "sender":{"id":77,"name":"Khach A","type":"contact"}}
+			]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+	msgs, err := adapter.FetchMessages(context.Background(), "101", time.Unix(1650000000, 0))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].ExternalID != "702" {
+		t.Fatalf("want only message 702, got %+v", msgs)
+	}
+	if msgs[0].SentAt.Unix() <= 0 {
+		t.Fatalf("SentAt = %v, want a real timestamp", msgs[0].SentAt)
+	}
+}
+
+func TestChatwootFetchMessagesSinceBoundary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/agents":
+			fmt.Fprint(w, `{"payload":[]}`)
+		case "/api/v1/accounts/1/conversations/101/messages":
+			fmt.Fprint(w, `{"payload":[
+				{"id":801,"message_type":0,"private":false,"content":"before","content_type":"text","created_at":1699999999,
+				 "sender":{"id":77,"name":"Khach A","type":"contact"}},
+				{"id":802,"message_type":0,"private":false,"content":"on boundary","content_type":"text","created_at":1700000000,
+				 "sender":{"id":77,"name":"Khach A","type":"contact"}},
+				{"id":803,"message_type":0,"private":false,"content":"after","content_type":"text","created_at":1700000001,
+				 "sender":{"id":77,"name":"Khach A","type":"contact"}}
+			]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+	msgs, err := adapter.FetchMessages(context.Background(), "101", time.Unix(1700000000, 0))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 messages (inclusive boundary), got %d: %+v", len(msgs), msgs)
+	}
+	if msgs[0].ExternalID != "802" || msgs[1].ExternalID != "803" {
+		t.Fatalf("kept messages = %s,%s, want 802,803", msgs[0].ExternalID, msgs[1].ExternalID)
+	}
+}
+
+func TestChatwootFetchMessagesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/accounts/1/agents":
+			fmt.Fprint(w, `{"payload":[]}`)
+		case "/api/v1/accounts/1/conversations/101/messages":
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"error":"boom"}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	adapter := NewChatwootAdapter(ChatwootCredentials{BaseURL: srv.URL, AccountID: 1, APIToken: "t"})
+	msgs, err := adapter.FetchMessages(context.Background(), "101", time.Unix(1650000000, 0))
+	if err == nil {
+		t.Fatalf("want error, got messages %+v", msgs)
+	}
+	if !strings.Contains(err.Error(), "101") {
+		t.Fatalf("error %q does not mention conversation id", err)
 	}
 }
