@@ -246,6 +246,7 @@ func (s *SyncEngine) upsertMessage(tenantID, conversationID string, msg channels
 		tenantID, conversationID, msg.ExternalID).First(&existing)
 	if result.Error == nil {
 		// Message exists — update attachments if we have new local paths
+		updates := map[string]interface{}{}
 		hasLocalPath := false
 		for _, att := range msg.Attachments {
 			if att.LocalPath != "" {
@@ -255,7 +256,20 @@ func (s *SyncEngine) upsertMessage(tenantID, conversationID string, msg channels
 		}
 		if hasLocalPath {
 			attachmentsJSON, _ := json.Marshal(msg.Attachments)
-			db.DB.Model(&existing).Update("attachments", string(attachmentsJSON))
+			updates["attachments"] = string(attachmentsJSON)
+		}
+		// Backfill sender fields only when currently empty
+		if existing.SenderExternalID == "" && msg.SenderExternalID != "" {
+			updates["sender_external_id"] = msg.SenderExternalID
+		}
+		if existing.SenderEmail == "" && msg.SenderEmail != "" {
+			updates["sender_email"] = msg.SenderEmail
+		}
+		if existing.SenderName == "" && msg.SenderName != "" {
+			updates["sender_name"] = msg.SenderName
+		}
+		if len(updates) > 0 {
+			return db.DB.Model(&existing).Updates(updates).Error
 		}
 		return nil
 	}
